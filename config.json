@@ -1,0 +1,19 @@
+{
+  "ollama_base_url": "http://127.0.0.1:11434",
+  "model": "qwen2.5:7b",
+  "hotkey": "ctrl+alt+j",
+  "auto_start": false,
+  "pet_size": 96,
+  "opacity": 0.95,
+  "token_price": {
+    "prompt_per_1k": null,
+    "completion_per_1k": null,
+    "currency": "CNY"
+  },
+  "marvis_state_source": {
+    "type": "none",
+    "url": "",
+    "file": "",
+    "interval": 3000
+  }
+}

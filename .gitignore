@@ -1,0 +1,29 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.manifest
+
+# 本机临时文件
+temp/
+*.log
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 运行时生成的本机配置（含个人 Ollama 地址/热键）
+# 注意：仓库中的 config.json 是默认配置模板，应保留
+!config.json

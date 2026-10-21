@@ -1,29 +1,26 @@
-# 虚拟环境
+# Python
 .venv/
-venv/
-env/
-
-# Python 缓存
 __pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
+*.pyc
+*.pyo
 
-# PyInstaller 构建产物
-build/
-dist/
-*.manifest
+# Node
+dsh-pet/node_modules/
+node_modules/
 
-# 本机临时文件
+# 中间产物与调试文件
 temp/
 *.log
+temp_*.png
+smoke_*.py
+smoke_err.log
+smoke_out.log
+*.bak*
+err.log
+pet_diag*.log
 
-# 编辑器
-.vscode/
-.idea/
-*.swp
+# 系统/编辑器
 .DS_Store
-
-# 运行时生成的本机配置（含个人 Ollama 地址/热键）
-# 注意：仓库中的 config.json 是默认配置模板，应保留
-!config.json
+Thumbs.db
+.idea/
+.vscode/

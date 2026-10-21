@@ -24,8 +24,8 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-echo [3/4] 开始打包...
-"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed --name MarvisPet main.py
+echo [3/4] 开始打包（MarvisPet.spec 含 assets 资源，使用 pyinstaller.exe 直调以避免 python -m 输出异常）...
+".venv\Scripts\pyinstaller.exe" --noconfirm --clean MarvisPet.spec
 if errorlevel 1 (
     echo   [错误] 打包失败，请查看上方日志
     pause & exit /b 1

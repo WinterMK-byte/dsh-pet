@@ -5,6 +5,11 @@
   "auto_start": false,
   "pet_size": 96,
   "opacity": 0.95,
+  "pet_style": "sprite",
+  "pet_character": "fish",
+  "fish_version": "adult",
+  "pet_on_top": true,
+  "anim_fps": 165,
   "token_price": {
     "prompt_per_1k": null,
     "completion_per_1k": null,
@@ -15,5 +20,7 @@
     "url": "",
     "file": "",
     "interval": 3000
-  }
+  },
+  "anim_frame_fps": 24,
+  "sleep_after": 300
 }

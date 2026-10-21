@@ -15,20 +15,26 @@ Marvis Pet —— 本地桌宠程序（Windows / Python 3.12 + PySide6）
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import html
 import json
 import math
 import os
+import random
 import sys
+import threading
 import time
 
 import requests
 
 from PySide6.QtCore import (
+    QAbstractNativeEventFilter,
     QObject,
     QPoint,
     QPointF,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QThread,
@@ -37,6 +43,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QColor,
     QCursor,
     QFont,
@@ -46,6 +53,7 @@ from PySide6.QtGui import (
     QPixmap,
     QRadialGradient,
     QTextCursor,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -74,14 +82,46 @@ DEFAULT_CONFIG = {
     "auto_start": False,
     "pet_size": 96,
     "opacity": 0.95,
+    # 窗口置顶：True=悬浮置顶（可见性优先），False=桌面层（不遮挡工作窗口）
+    "pet_on_top": True,
+    # 宠物形象：sprite=图片形象（真实形象/大肥鱼/小马），orb=粒子光球
+    "pet_style": "sprite",
+    # 形象：real=老板9张原图真实形象，fish=大肥鱼，pony=marvis 小马
+    "pet_character": "pony",
+    # fish 形象版本：adult=成年版，baby=幼年版（仅 fish 生效）
+    "fish_version": "adult",
+    # 图片形象动画刷新率（fps），默认 165（约 6ms/帧）
+    "anim_fps": 165,
+    # 逐帧动画播放帧率（fps）：帧序列按此速率推进，渲染仍由 anim_fps 驱动
+    # 2026-10-21 由 12 提到 24：dsh-pet 素材每动作 48 帧，12fps 一轮 4 秒偏慢，
+    # 24fps 一轮 2 秒更接近原始 webm 节奏。
+    "anim_frame_fps": 24,
+    # 空闲多久（秒）后点播一轮睡眠动作；0 = 不自动睡眠
+    "sleep_after": 300,
     # token 单价估算预留：prompt_per_1k / completion_per_1k 配置后启用金额估算，
     # 保持 None 时本地模型标注"本地免费"。
     "token_price": {"prompt_per_1k": None, "completion_per_1k": None, "currency": "CNY"},
-    # Marvis 状态出口（预留）：type = none | file | http
+    # Marvis 状态出口：type = none | file | http | marvis
+    #   - marvis: 直连本机 Marvis 应用 data.db（agent_activities / messages），
+    #             桌宠实时展示 Marvis 主应用任务流程（推荐，零额外进程）
     #   - file: 轮询本地状态 JSON（含 sessions 数组）展示 Marvis 任务流程
     #   - http: 轮询 HTTP 端点（同上）
     #   - none: 不启用，降级为本地对话流程卡片
-    "marvis_state_source": {"type": "none", "url": "", "file": "", "interval": 3000},
+    "marvis_state_source": {"type": "marvis", "url": "", "file": "", "interval": 3000},
+    # 拖拽甩抛物理（仿 dsh-pet）：gravity=重力 px/s²、restitution=碰壁恢复系数 0~1、
+    # groundFriction=落地水平衰减(/s)、ceilingBounce=顶部是否反弹、throwPower=甩抛力度增益
+    "physics": {"gravity": 1400, "restitution": 0.78, "groundFriction": 2.5,
+                "ceilingBounce": True, "throwPower": 1.0},
+    # 工作状态六档气泡文案（仿 dsh-pet workStatusTexts）：
+    # 0 thinking / 1 working / 2 result / 3 waiting / 4 success / 5 error
+    "work_status_texts": [
+        ["正在认真想下一步呢", "让我整理一下思路~"],
+        ["正在处理任务呢", "正在继续干活哦"],
+        ["这一步处理好啦", "搞定一步，继续看看"],
+        ["需要你确认一下呢", "轮到你来决定啦"],
+        ["这一轮搞定啦", "任务完成咯"],
+        ["这一步没跑通呢", "刚才的操作遇到点问题"],
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -102,16 +142,102 @@ def load_config() -> dict:
     path = config_path()
     try:
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 user = json.load(f)
             if isinstance(user, dict):
                 cfg.update({k: v for k, v in user.items() if k in DEFAULT_CONFIG})
         else:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
     return cfg
+
+
+def save_config(cfg: dict):
+    """把当前配置持久化回 config.json（仅写白名单字段，不破坏未知配置）。"""
+    path = config_path()
+    merged = dict(cfg)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8-sig") as f:
+                old = json.load(f)
+            if isinstance(old, dict):
+                merged = dict(old)
+                merged.update({k: v for k, v in cfg.items() if k in DEFAULT_CONFIG})
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def assets_dir() -> str:
+    """图片形象资源目录：源码运行取项目 assets，打包后取 PyInstaller 解包目录 assets。"""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets")
+
+
+def probe_anim_frame_size():
+    """探测逐帧素材的单帧像素尺寸（取首个动作的首帧），用于按素材宽高比开窗口。
+
+    dsh-pet 帧为 640x360（16:9 横版）；若窗口仍开正方形，横版素材只占 82x46，
+    宠物会明显偏小。返回 (w, h)；探测失败返回 None（回退正方形）。
+    """
+    anim_dir = os.path.join(assets_dir(), "anim")
+    if not os.path.isdir(anim_dir):
+        return None
+    try:
+        subs = [d for d in os.listdir(anim_dir)
+                if os.path.isdir(os.path.join(anim_dir, d))]
+        subs.sort()
+        for name in subs:
+            p = os.path.join(anim_dir, name, "frame_000.png")
+            if not os.path.exists(p):
+                continue
+            # 直接读 PNG 头 IHDR（偏移 16..23 = 宽、高），零依赖、不解码整图
+            with open(p, "rb") as f:
+                head = f.read(24)
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                w = int.from_bytes(head[16:20], "big")
+                h = int.from_bytes(head[20:24], "big")
+                if w > 0 and h > 0:
+                    return w, h
+    except Exception:
+        pass
+    return None
+
+
+_ANIM_CACHE_SIZE = None
+
+
+def anim_cache_size():
+    """逐帧缓存尺寸：pet_size × 素材宽高比 × 2 倍余量。
+
+    106 动作 × 48 帧、单帧 640x360 全尺寸常驻太贵（9 个常驻动作实测约 457MB），
+    加载到窗口 2 倍尺寸即可（约 1/4 内存），画质对 96~171px 的窗口绰绰有余。
+    返回 (w, h)；探测失败返回 None（保持原尺寸）。结果只算一次并缓存。
+    """
+    global _ANIM_CACHE_SIZE
+    if _ANIM_CACHE_SIZE is not None:
+        return _ANIM_CACHE_SIZE or None
+    res = None
+    try:
+        cfg = load_config()
+        size = max(48, int(cfg.get("pet_size", 96)))
+        fs = probe_anim_frame_size()
+        if fs and fs[1]:
+            ar = fs[0] / float(fs[1])
+            res = (max(48, int(round(size * ar))) * 2, size * 2)
+    except Exception:
+        res = None
+    _ANIM_CACHE_SIZE = res or False
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -234,32 +360,164 @@ class ChatWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class HotkeyManager(QObject):
+    """全局热键（默认 Ctrl+Alt+J）。
+
+    使用 Win32 WH_KEYBOARD_LL 低级键盘钩子实现（自研 ctypes，不依赖 keyboard/pynput）：
+    - keyboard 库钩子在 PyInstaller 打包环境下注册成功但收不到按键（ctypes 回调失效），弃用；
+    - RegisterHotKey 系统热键不受模拟输入触发，冒烟测试无法覆盖，弃用；
+    - LL 钩子对真实键盘与模拟输入均生效，打包后同样可靠。
+    """
+
     triggered = Signal()
 
     def __init__(self):
         super().__init__()
-        self._handler = None
+        self._hook = _LowLevelKeyboardHook()
+        self._hook.fired.connect(self.triggered)
 
     def start(self, hotkey: str) -> bool:
         try:
-            import keyboard
+            import ctypes
+            _hook_diag("HotkeyManager.start(%r)" % hotkey)
 
-            self._handler = keyboard.add_hotkey(hotkey, self._emit, suppress=False)
+            mods, vk = [], None
+            parts = [p.strip() for p in hotkey.lower().replace("+", " ").split() if p.strip()]
+            for p in parts:
+                if p in ("ctrl", "control"):
+                    mods.append(0x11)
+                elif p == "alt":
+                    mods.append(0x12)
+                elif p == "shift":
+                    mods.append(0x10)
+                elif p in ("win", "windows", "super"):
+                    mods.extend([0x5B, 0x5C])
+                elif p == "space":
+                    vk = 0x20
+                elif len(p) == 1:
+                    vk = ord(p.upper())
+                elif p.startswith("f") and p[1:].isdigit():
+                    vk = 0x70 + int(p[1:]) - 1
+                else:
+                    return False
+            if vk is None:
+                return False
+            _hook_diag("hotkey parsed vk=%s mods=%s" % (vk, mods))
+            return self._hook.start(vk, mods)
+        except Exception:
+            return False
+
+    def stop(self):
+        self._hook.stop()
+
+
+def _hook_diag(msg: str):
+    """钩子诊断日志：仅当环境变量 MARVIS_HOOK_DIAG=1 时写入 cwd 下 hook_diag.log。"""
+    if os.environ.get("MARVIS_HOOK_DIAG") == "1":
+        try:
+            with open("hook_diag.log", "a", encoding="utf-8") as _f:
+                _f.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+        except Exception:
+            pass
+
+
+class _LowLevelKeyboardHook(QObject):
+    """WH_KEYBOARD_LL 低级键盘钩子：命中指定组合键（修饰键按下 + 目标键）时发 fired 信号。"""
+
+    fired = Signal()
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+
+    def __init__(self):
+        super().__init__()
+        self._vk = None
+        self._mods = []
+        self._hook = None
+        self._thread = None
+        self._stop = threading.Event()
+        self._cb_ref = None
+
+    def start(self, vk: int, mod_vks) -> bool:
+        try:
+            import ctypes
+            import ctypes.wintypes
+            import threading
+
+            class KBDLLHOOKSTRUCT(ctypes.Structure):
+                _fields_ = [
+                    ("vkCode", ctypes.wintypes.DWORD),
+                    ("scanCode", ctypes.wintypes.DWORD),
+                    ("flags", ctypes.wintypes.DWORD),
+                    ("time", ctypes.wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            HOOKPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_longlong, ctypes.c_int,
+                ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM,
+            )
+
+            def _proc(nCode, wParam, lParam):
+                try:
+                    if nCode >= 0 and wParam in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                        kbd = KBDLLHOOKSTRUCT.from_address(lParam)
+                        if kbd.vkCode == self._vk:
+                            user32 = ctypes.WinDLL("user32", use_last_error=True)
+                            _hook_diag("keydown vk=%s mods=%s" % (kbd.vkCode, self._mods))
+                            if all(user32.GetAsyncKeyState(m) & 0x8000 for m in self._mods):
+                                _hook_diag("HOTKEY FIRED -> emit")
+                                self.fired.emit()
+                except Exception:
+                    pass
+                return ctypes.WinDLL("user32", use_last_error=True).CallNextHookEx(None, nCode, wParam, lParam)
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            self._vk = vk
+            self._mods = list(mod_vks)
+            self._stop.clear()
+            self._cb_ref = HOOKPROC(_proc)
+            # WH_KEYBOARD_LL 钩子的 hMod 传 NULL 即可（回调在当前进程），
+            # 切勿用 GetModuleHandleW(None) —— 默认 restype 为 c_int 会截断返回值导致 err 126。
+            self._hook = user32.SetWindowsHookExW(
+                self.WH_KEYBOARD_LL, self._cb_ref, None, 0,
+            )
+            _hook_diag("SetWindowsHookExW ret=%s err=%s" % (self._hook, ctypes.get_last_error()))
+            if not self._hook:
+                self._cb_ref = None
+                _hook_diag("hook install failed")
+                return False
+
+            def _msg_loop():
+                import ctypes.wintypes
+
+                msg = ctypes.wintypes.MSG()
+                while not self._stop.is_set():
+                    r = user32.GetMessageW(ctypes.byref(msg), 0, 0, 0)
+                    if r in (0, -1):
+                        break
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+
+            self._thread = threading.Thread(target=_msg_loop, daemon=True)
+            self._thread.start()
             return True
         except Exception:
             return False
 
-    def _emit(self):
-        # 钩子线程回调；Signal 默认 AutoConnection，跨线程自动排队到主线程
-        self.triggered.emit()
-
     def stop(self):
         try:
-            import keyboard
+            import ctypes
 
-            if self._handler is not None:
-                keyboard.remove_hotkey(self._handler)
-                self._handler = None
+            self._stop.set()
+            if self._hook:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.UnhookWindowsHookEx(self._hook)
+                self._hook = None
+            if self._thread is not None and self._thread.ident:
+                ctypes.WinDLL("user32", use_last_error=True).PostThreadMessageW(
+                    self._thread.ident, 0x0012, 0, 0
+                )
+                self._thread = None
         except Exception:
             pass
 
@@ -348,7 +606,8 @@ class TaskOverlay(QWidget):
         self._local_cards: dict[str, TaskCardItem] = {}
         self._marvis_cards: dict[str, TaskCardItem] = {}
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+            Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+            | (Qt.WindowStaysOnTopHint if self.pet._on_top else Qt.WindowStaysOnBottomHint)
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
@@ -452,7 +711,7 @@ class MarvisStatePoller(QObject):
 
     def start(self):
         t = str(self.source.get("type") or "none")
-        if t in ("file", "http"):
+        if t in ("file", "http", "marvis"):
             self._timer.start(int(self.source.get("interval") or 3000))
 
     def stop(self):
@@ -461,12 +720,14 @@ class MarvisStatePoller(QObject):
     def _poll(self):
         try:
             t = str(self.source.get("type") or "none")
-            if t == "file":
+            if t == "marvis":
+                data = self._query_marvis_db()
+            elif t == "file":
                 path = self.source.get("file") or ""
                 if not path or not os.path.exists(path):
                     self.overlay.clear_marvis_sessions()
                     return
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8-sig") as f:
                     data = json.load(f)
             elif t == "http":
                 url = self.source.get("url") or ""
@@ -481,6 +742,387 @@ class MarvisStatePoller(QObject):
         except Exception:
             # 状态出口无数据 / 读取失败 → 降级：仅保留本地对话流程卡片
             self.overlay.clear_marvis_sessions()
+
+    @staticmethod
+    def _query_marvis_db() -> dict:
+        """直连本机 Marvis 应用 data.db，把 agent_activities / messages 映射为任务卡片。
+
+        状态判定（全为只读查询，绝不写库）：
+        - 最近 3 分钟内有子 Agent 活动 → 出卡片（completed+success=done，
+          completed+failed=failed，其余=thinking），标题为 agent 名、内容为汇报摘要；
+        - 最近 60 秒内有 user 消息且最新消息仍是 user → thinking（等待处理中）；
+        - 最近 3 分钟无任何活动 → 返回空 sessions（桌宠回 idle）。
+        """
+        sessions: list = []
+        base = os.path.join(os.environ.get("APPDATA", ""), "Tencent", "Marvis", "User")
+        db_path = ""
+        if os.path.isdir(base):
+            best = None
+            for uid in os.listdir(base):
+                p = os.path.join(base, uid, "database", "data.db")
+                if os.path.exists(p):
+                    mtime = os.path.getmtime(p)
+                    if best is None or mtime > best[1]:
+                        best = (p, mtime)
+            db_path = best[0] if best else ""
+        if not db_path or not os.path.exists(db_path):
+            return {"sessions": []}
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+        con = sqlite3.connect("file:" + db_path.replace("\\", "/") + "?mode=ro",
+                              uri=True, timeout=2)
+        try:
+            cur = con.cursor()
+            # 最近活动（agent_activities.activity_time 为本地时间，可直接与本地 now 比较）
+            now = datetime.now()
+            cutoff_act = (now - timedelta(seconds=180)).strftime("%Y-%m-%dT%H:%M:%S")
+            rows = cur.execute(
+                "SELECT id, agent_name, content, status, outcome_status, activity_time"
+                " FROM agent_activities WHERE activity_time >= ?"
+                " ORDER BY activity_time DESC LIMIT 3", (cutoff_act,)
+            ).fetchall()
+            for rid, aname, content, status, outcome, atime in rows:
+                if status == "completed" and outcome == "success":
+                    state = "done"
+                elif status == "completed" and outcome == "failed":
+                    state = "failed"
+                else:
+                    state = "thinking"
+                detail = (content or "").strip().replace("\n", " ")
+                if len(detail) > 42:
+                    detail = detail[:42] + "…"
+                sessions.append({
+                    "id": f"act-{rid}",
+                    "title": aname or "Marvis",
+                    "state": state,
+                    "detail": detail,
+                })
+            # 最近消息兜底：60s 内有 user 消息且最新消息仍是 user → 等待处理
+            cutoff_msg = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S")
+            last = cur.execute(
+                "SELECT role, created_at FROM messages WHERE created_at >= ?"
+                " ORDER BY created_at DESC LIMIT 1", (cutoff_msg,)
+            ).fetchone()
+            if last and last[0] == "user" and not sessions:
+                sessions.append({
+                    "id": "msg-waiting",
+                    "title": "Marvis",
+                    "state": "thinking",
+                    "detail": "正在处理你的消息",
+                })
+        finally:
+            con.close()
+        return {"sessions": sessions}
+
+
+# ---------------------------------------------------------------------------
+# 图片形象（双形象 sprite 模式）
+# ---------------------------------------------------------------------------
+
+# 双形象：状态 -> assets 图片文件名
+# 大肥鱼形象版本：adult=成年版（图1-2），baby=幼年版（图3-9），各 4 态表情素材
+FISH_VERSIONS = {
+    # 素材 = dsh-pet 蓝发小女仆（大肥鱼）形象四态；baby 暂无独立帧，先复用 adult
+    "adult": {
+        "idle": "fish_idle.png",
+        "thinking": "fish_thinking.png",
+        "replying": "fish_replying.png",
+        "error": "fish_error.png",
+    },
+    "baby": {
+        "idle": "fish_idle.png",
+        "thinking": "fish_thinking.png",
+        "replying": "fish_replying.png",
+        "error": "fish_error.png",
+    },
+}
+CHARACTER_STATES = {
+    "fish": FISH_VERSIONS["adult"],  # 动态引用，实际按 fish_version 选择
+    "pony": {
+        "idle": "pony_idle.png",
+        "thinking": "pony_thinking.png",
+        "replying": "pony_replying.png",
+        "error": "pony_error.png",
+    },
+    # 真实形象（老板 9 张原图重制）：四态单贴图兜底，逐帧动画走 anim/real_<state>/
+    "real": {
+        "idle": "real_idle.png",
+        "thinking": "real_thinking.png",
+        "replying": "real_replying.png",
+        "error": "real_error.png",
+    },
+}
+CHARACTER_NAMES = {"fish": "大肥鱼", "pony": "marvis 小马", "real": "真实形象"}
+FISH_VERSION_NAMES = {"adult": "成年版", "baby": "幼年版"}
+
+# 逐帧动画：状态 -> 动作序列（assets/anim/<action>/frame_000.png...）。
+# 动作名直接对齐 dsh-pet assets/webm 素材名（已全量抽帧为透明 PNG）。
+# idle 支持多动作轮播；error 有专属帧（被吓一跳）但保留抖动叠加。
+ANIM_ACTIONS = {
+    "idle": ["待机呼吸休闲", "东张西望", "原地漂浮踏步", "悠闲哼歌"],  # 发呆漂浮/张望/漂浮踏步/哼歌 轮播
+    "thinking": ["深度思考碎碎念", "工作状态-思考冒泡"],
+    "replying": ["轻快记录", "工作状态-忙碌点按"],
+    "error": ["被吓一跳"],
+}
+
+# 余额（钱袋）分档：按**本次会话累计消耗的 prompt token** 映射 dsh-pet 的六个钱袋动作。
+# 本地 Ollama 是"本地免费"，没有真余额；这里用"烧掉的 token 越多 → 袋子越瘪"作隐喻。
+# 阈值单位 = prompt token 累计；跨档时点播一轮对应动作。
+BALANCE_TIERS = [
+    (2000,    "余额-钱袋满溢"),
+    (8000,    "余额-金袋叮当"),
+    (20000,   "余额-钱袋如常"),
+    (50000,   "余额-数金皱眉"),
+    (100000,  "余额-袋空如洗"),
+]
+
+# 空闲睡眠：idle 且长时间无交互 → 点播一轮（播完自动回 idle，下次超时再播）
+SLEEP_ACTIONS = ["哈欠连天", "原地小憩沉眠"]
+
+
+class PetSprite:
+    """图片形象渲染器：加载 4 态表情 QPixmap 与逐帧动画序列，
+    按动画相位计算 上下浮动 / 左右摇摆 / 呼吸缩放 / 状态特效
+    （思考晃、回复跳、出错抖），叠加在帧动画之上作为微动。"""
+
+    def __init__(self, character: str, fish_version: str = "adult",
+                 frame_fps: float = 12.0):
+        self.character = character if character in CHARACTER_STATES else "fish"
+        self.fish_version = fish_version if fish_version in FISH_VERSIONS else "adult"
+        self.frame_fps = max(1.0, float(frame_fps))
+        self._pixmaps: dict[str, QPixmap] = {}
+        self._frames: dict[str, list[QPixmap]] = {}
+        self._override = None  # 点播单动作（仿 dsh-pet 右键点播）：动作名或 None
+        self._override_t0 = 0.0
+        self._pooled_actions = set()  # 常驻挂载动作名（ANIM_ACTIONS），点播动作播完即卸载
+        self._load()
+
+    def _fit(self, pix: QPixmap) -> QPixmap:
+        """把原帧缩到缓存尺寸（窗口 2 倍）以控内存：9 常驻动作 457MB → 约 130MB。"""
+        if pix.isNull():
+            return pix
+        sz = anim_cache_size()
+        if not sz:
+            return pix
+        cw, ch = sz
+        if pix.width() <= cw and pix.height() <= ch:
+            return pix
+        return pix.scaled(cw, ch, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+    def _load_frames(self):
+        """从 assets/anim/<action>/frame_000.png... 加载逐帧序列。
+
+        fish 形象使用全局 ANIM_ACTIONS 动作池；
+        real 形象按状态加载 assets/anim/real_<state>/frame_000.png...。
+        """
+        self._frames = {}
+        self._pooled_actions = set()
+        anim_dir = os.path.join(assets_dir(), "anim")
+        if not os.path.isdir(anim_dir):
+            return
+        if self.character == "real":
+            for state in ("idle", "thinking", "replying", "error"):
+                seq = []
+                for i in range(100):
+                    p = os.path.join(anim_dir, f"real_{state}", f"frame_{i:03d}.png")
+                    if not os.path.exists(p):
+                        break
+                    pix = QPixmap(p)
+                    if not pix.isNull():
+                        seq.append(pix)
+                if seq:
+                    self._frames[f"real_{state}"] = seq
+        elif self.character == "fish":
+            for actions in ANIM_ACTIONS.values():
+                for action in actions:
+                    if action in self._frames:
+                        continue
+                    seq = []
+                    for i in range(100):
+                        p = os.path.join(anim_dir, action, f"frame_{i:03d}.png")
+                        if not os.path.exists(p):
+                            break
+                        pix = QPixmap(p)
+                        if not pix.isNull():
+                            seq.append(self._fit(pix))
+                    if seq:
+                        self._frames[action] = seq
+                        self._pooled_actions.add(action)
+        if os.environ.get("MARVIS_PET_DIAG"):
+            with open(f"pet_diag_{os.getpid()}.log", "a", encoding="utf-8") as _df:
+                _df.write(f"[diag] frames: " +
+                          ", ".join(f"{k}={len(v)}" for k, v in self._frames.items()) + "\n")
+
+    def _pick_frame(self, state: str, t: float) -> QPixmap | None:
+        """按累计时间 t 与 frame_fps 取当前动作帧；idle 多动作轮播。
+
+        点播（override）：有素材则播放一轮后自动清除回退 idle；无素材静默回退。
+        """
+        if self._override is not None:
+            pool = self._frames.get(self._override, [])
+            if pool:
+                remaining = (t - self._override_t0) * self.frame_fps
+                if remaining >= len(pool):
+                    self._finish_override()
+                else:
+                    return pool[int(remaining)]
+            else:
+                self._finish_override()
+        if self.character == "real":
+            actions = [f"real_{state}"] if state in ("idle", "thinking", "replying", "error") else []
+        else:
+            actions = ANIM_ACTIONS.get(state)
+        if not actions:
+            return None
+        pool: list[QPixmap] = []
+        for a in actions:
+            pool.extend(self._frames.get(a, []))
+        if not pool:
+            return None
+        idx = int(t * self.frame_fps) % len(pool)
+        return pool[idx]
+
+    def play_once(self, action: str, t0: float):
+        """点播单动作：有逐帧素材则播放一轮（用调用方时间基准 t0 对齐）。
+        未常驻挂载的动作（如右键点播的任意 dsh-pet 动作）即时从磁盘加载，
+        播放一轮后自动卸载释放内存。"""
+        pool = self._frames.get(action)
+        if not pool:
+            pool = self._load_action_frames(action)
+        if pool:
+            self._override = action
+            self._override_t0 = t0
+        else:
+            self._override = None
+
+    def _load_action_frames(self, action: str) -> list[QPixmap]:
+        """按动作名从磁盘加载逐帧序列（assets/anim/<action>/frame_000.png...）。"""
+        anim_dir = os.path.join(assets_dir(), "anim")
+        if not os.path.isdir(anim_dir):
+            return []
+        seq = []
+        for i in range(100):
+            p = os.path.join(anim_dir, action, f"frame_{i:03d}.png")
+            if not os.path.exists(p):
+                break
+            pix = QPixmap(p)
+            if not pix.isNull():
+                seq.append(self._fit(pix))
+        if seq:
+            self._frames[action] = seq
+        return seq
+
+    def _finish_override(self):
+        """点播结束：清除 override；非常驻动作从缓存卸载，避免 106 个动作全量常驻。"""
+        a = self._override
+        self._override = None
+        if a and a not in self._pooled_actions:
+            self._frames.pop(a, None)
+
+    def _load(self):
+        states = CHARACTER_STATES[self.character]
+        if self.character == "fish":
+            states = FISH_VERSIONS[self.fish_version]
+        if os.environ.get("MARVIS_PET_DIAG"):
+            with open(f"pet_diag_{os.getpid()}.log", "a", encoding="utf-8") as _df:
+                _df.write(f"[diag] assets_dir={assets_dir()} character={self.character} version={self.fish_version}\n")
+                for state, fname in states.items():
+                    p = os.path.join(assets_dir(), fname)
+                    pix = QPixmap(p)
+                    _df.write(f"[diag] load {state}: {p} null={pix.isNull()}\n")
+        for state, fname in states.items():
+            pix = QPixmap(os.path.join(assets_dir(), fname))
+            if not pix.isNull():
+                self._pixmaps[state] = pix
+        self._load_frames()
+        if os.environ.get("MARVIS_PET_DIAG"):
+            with open(f"pet_diag_{os.getpid()}.log", "a", encoding="utf-8") as _df:
+                _df.write(f"[diag] loaded states: {sorted(self._pixmaps.keys())}\n")
+
+    def set_fish_version(self, version: str):
+        """fish 形象切换幼年/成年版，重新加载素材（仅 fish 生效）。"""
+        if self.character != "fish" or version not in FISH_VERSIONS:
+            return
+        self.fish_version = version
+        self._pixmaps.clear()
+        self._load()
+
+    def has_image(self, state: str) -> bool:
+        return state in self._pixmaps
+
+    def pixmap(self, state: str) -> QPixmap | None:
+        # 表情缺失时回退到 idle，保证任何状态都能渲染
+        return self._pixmaps.get(state) or self._pixmaps.get("idle")
+
+    def paint(self, painter: QPainter, w: int, h: int, state: str,
+              t: float, snapped: bool, error_dt: float = 0.0):
+        """在 (w,h) 画布内绘制当前形象。t=累计动画秒数；snapped=贴边收纳。"""
+        # 逐帧动画优先：有帧序列时用帧图，否则回退四态单贴图
+        frame_pix = self._pick_frame(state, t)
+        pix = frame_pix if frame_pix is not None else self.pixmap(state)
+        if pix is None:
+            return
+        pix_w, pix_h = pix.width(), pix.height()
+        if pix_w <= 0 or pix_h <= 0:
+            return
+        if snapped:
+            # 贴边收纳：绘制缩小图标，跟随状态色
+            side = min(w, h)
+            target = QPixmap(pix).scaled(
+                max(6, side * 2 // 3), max(6, side * 2 // 3),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            painter.setOpacity(0.85)
+            painter.drawPixmap(
+                int((w - target.width()) / 2), int((h - target.height()) / 2), target
+            )
+            return
+
+        # ---- 程序化动画参数（time-based，dt 驱动，与帧率解耦）----
+        # 上下浮动（0.5Hz 正弦，幅度随状态变化）
+        float_amp = 3.0
+        # 左右摇摆（0.3Hz 正弦，绕中心小角度旋转）
+        swing_amp = 4.0
+        # 呼吸缩放
+        breath_amp = 0.03
+        if state == "thinking":
+            float_amp = 4.5
+            swing_amp = 8.0
+            breath_amp = 0.05
+        elif state == "replying":
+            float_amp = 5.5
+            swing_amp = 3.0
+            breath_amp = 0.07
+        elif state == "error":
+            float_amp = 3.0
+            swing_amp = 5.0
+            breath_amp = 0.04
+
+        fy = math.sin(t * math.tau * 0.5) * float_amp
+        rot = math.sin(t * math.tau * 0.3) * swing_amp
+        scale = 1.0 + breath_amp * math.sin(t * math.tau * 0.8)
+        # 出错抖动：叠加高频偏移
+        jx = 0.0
+        jy = 0.0
+        if state == "error":
+            jx = math.sin(t * math.tau * 8.0) * 1.8
+            jy = math.cos(t * math.tau * 9.0) * 1.8
+
+        # 目标绘制尺寸：贴合窗口，留出动画余量
+        draw_w = int(min(w, h) * 0.86 * scale)
+        draw_h = int(draw_w * pix_h / pix_w)
+        scaled = QPixmap(pix).scaled(
+            draw_w, draw_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+
+        painter.save()
+        painter.translate(w / 2 + jx, h / 2 + fy + jy)
+        painter.rotate(rot)
+        painter.setOpacity(1.0)
+        painter.drawPixmap(
+            int(-scaled.width() / 2), int(-scaled.height() / 2), scaled
+        )
+        painter.restore()
 
 
 # ---------------------------------------------------------------------------
@@ -518,22 +1160,56 @@ class PetWindow(QWidget):
         self._restore_rect = QRect()
         self._angle = 0.0
         self._pulse = 0.0
+        # 图片形象模式（双形象 / 粒子光球）
+        self.style = str(cfg.get("pet_style", "sprite"))
+        self.character = str(cfg.get("pet_character", "fish"))
+        self.fish_version = str(cfg.get("fish_version", "adult"))
+        self.sprite = PetSprite(self.character, self.fish_version,
+                                float(cfg.get("anim_frame_fps", 12)))
+        # time-based 动画：_anim_t 累计秒数，_last_tick 上一帧时间戳
+        self._anim_t = 0.0
+        self._last_tick = time.monotonic()
         # 事件气泡（done! / oops / hey!）
         self._bubble = None  # {"text":..., "color":QColor, "start":float, "duration":float}
         self._bubble_timer = QTimer(self)
         self._bubble_timer.timeout.connect(self._bubble_tick)
         self._bubble_timer.start(40)
+        # 甩抛物理（仿 dsh-pet）：松手时按拖拽速度抛掷，重力下落 + 碰壁反弹 + 落地摩擦
+        self._phys_vx = 0.0
+        self._phys_vy = 0.0
+        self._phys_last_t = 0.0
+        self._phys_active = False
+        self._phys_timer = QTimer(self)
+        self._phys_timer.timeout.connect(self._physics_tick)
+        self._phys_timer.start(20)
+        # 拖拽测速（用于甩抛初速）
+        self._drag_last_ts = 0.0
+        self._drag_last_global = QPoint()
+        self._drag_vel = QPointF(0.0, 0.0)
 
         self.setWindowTitle(PET_TITLE)
+        # 位置策略：默认桌面层（WindowStaysOnBottomHint，不遮挡工作窗口）；
+        # 托盘/配置可切换为置顶悬浮（WindowStaysOnTopHint）。
+        self._on_top = bool(self.cfg.get("pet_on_top", False))
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+            Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+            | (Qt.WindowStaysOnTopHint if self._on_top else Qt.WindowStaysOnBottomHint)
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         size = max(48, int(cfg.get("pet_size", 96)))
-        self.setFixedSize(size, size)
+        self._pet_size = size
+        # 按逐帧素材真实宽高比开窗口（dsh-pet 帧为 640x360 横版）：
+        # 高度保持 pet_size，宽度按宽高比放大，避免横版素材被挤成小图。
+        self._pet_w, self._pet_h = size, size
+        _fs = probe_anim_frame_size()
+        if _fs and _fs[0] > 0 and _fs[1] > 0:
+            ar = _fs[0] / float(_fs[1])
+            if 1.05 < ar < 4.0:
+                self._pet_w = max(48, int(round(size * ar)))
+        self.setFixedSize(self._pet_w, self._pet_h)
         try:
             self.setWindowOpacity(float(cfg.get("opacity", 0.95)))
         except Exception:
@@ -543,17 +1219,30 @@ class PetWindow(QWidget):
 
         # 初始位置：屏幕右下角附近
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(screen.right() - size - 80, screen.bottom() - size - 80)
+        self.move(screen.right() - self._pet_w - 80, screen.bottom() - self._pet_h - 80)
 
-        # 动画刷新
+        # 动画刷新：图片形象按 anim_fps（默认 165fps ≈ 6ms/帧）高精度定时驱动；
+        # 动画参数为 time-based，即使定时器实际触发频率有抖动，运动速率也保持恒定。
+        try:
+            fps = max(30, int(cfg.get("anim_fps", 165)))
+        except (TypeError, ValueError):
+            fps = 165
         self._anim_timer = QTimer(self)
+        self._anim_timer.setTimerType(Qt.PreciseTimer)
         self._anim_timer.timeout.connect(self._tick)
-        self._anim_timer.start(30)
+        self._anim_timer.start(max(1, int(1000 / fps)))
 
         # 边缘触碰检测（收纳时自动展开）
         self._edge_timer = QTimer(self)
         self._edge_timer.timeout.connect(self._check_edge_hover)
         self._edge_timer.start(200)
+
+        # 空闲睡眠：idle 且无交互超过 sleep_after 秒 → 点播一轮睡眠动作（仿 dsh-pet）
+        self._last_activity = time.time()
+        self._sleep_idx = 0
+        self._sleep_timer = QTimer(self)
+        self._sleep_timer.timeout.connect(self._check_sleep)
+        self._sleep_timer.start(10000)
 
         # 任务流程卡片悬浮层（位于宠物上方）+ 对话面板
         self.overlay = TaskOverlay(self)
@@ -574,7 +1263,33 @@ class PetWindow(QWidget):
         if state not in STATE_COLORS:
             state = "idle"
         self.state = state
+        if state != "idle":
+            self._last_activity = time.time()  # 非空闲 = 有活动，推迟睡眠
         self.update()
+
+    # ----- 空闲睡眠 -----
+    def mark_activity(self):
+        """任何交互（点击/拖拽/对话/任务）都调用：重置空闲计时，唤醒。"""
+        self._last_activity = time.time()
+
+    def _check_sleep(self):
+        if self.state != "idle" or self._snapped or self._override_active():
+            return
+        try:
+            after = float(self.cfg.get("sleep_after", 300))
+        except (TypeError, ValueError):
+            after = 300.0
+        if after <= 0:
+            return
+        if time.time() - self._last_activity >= after:
+            action = SLEEP_ACTIONS[self._sleep_idx % len(SLEEP_ACTIONS)]
+            self._sleep_idx += 1
+            self._last_activity = time.time()
+            self.sprite.play_once(action, self._anim_t)
+            self.update()
+
+    def _override_active(self) -> bool:
+        return getattr(self.sprite, "_override", None) is not None
 
     # ----- 事件气泡（done! / oops / hey!）-----
     def add_bubble(self, text: str, color: str = "#ffd75a", duration: float = 1.8):
@@ -634,9 +1349,88 @@ class PetWindow(QWidget):
 
     # ----- 动画 tick -----
     def _tick(self):
-        self._angle += 0.05
-        self._pulse += 0.12
+        now = time.monotonic()
+        dt = min(0.1, max(0.0, now - self._last_tick))
+        self._last_tick = now
+        self._anim_t += dt
+        # 粒子光球动画按原 30ms/帧 节奏缩放，避免因帧率提升而加速
+        ratio = dt / 0.03
+        self._angle += 0.05 * ratio
+        self._pulse += 0.12 * ratio
         self.update()
+
+    # ----- 形象 / 风格切换 -----
+    def set_character(self, character: str):
+        """切换形象（real / fish / pony），即时生效。"""
+        if character not in CHARACTER_STATES:
+            return
+        self.character = character
+        self.sprite = PetSprite(character, self.fish_version,
+                                self.sprite.frame_fps)
+        self.update()
+
+    def set_fish_version(self, version: str):
+        """切换大肥鱼幼年/成年版（仅 fish 形象生效），即时生效。"""
+        if version not in FISH_VERSIONS:
+            return
+        if self.character != "fish":
+            return
+        self.fish_version = version
+        self.sprite.set_fish_version(version)
+        self.update()
+
+    def set_style(self, style: str):
+        """切换渲染风格（sprite 图片形象 / orb 粒子光球），即时生效。"""
+        if style not in ("sprite", "orb"):
+            return
+        self.style = style
+        self.update()
+
+    def set_on_top(self, on_top: bool):
+        """切换置顶/桌面层（默认桌面层，不遮挡工作窗口），即时生效。
+
+        on_top=False：窗口置于普通窗口之下（桌面层），不遮挡用户工作窗口；
+        on_top=True：置顶悬浮（旧版行为），供需要盯着桌宠时切换。
+        """
+        self._on_top = bool(on_top)
+        flags = (
+            Qt.FramelessWindowHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus
+            | (Qt.WindowStaysOnTopHint if self._on_top else Qt.WindowStaysOnBottomHint)
+        )
+        self.setWindowFlags(flags)  # 可见窗口会自动 hide，随后 show 应用新层级
+        self.show()
+        if self._on_top:
+            self.raise_()
+        if getattr(self, "overlay", None) is not None:
+            self.overlay.setWindowFlags(flags)
+            self.overlay.show()
+        # Qt 的 WindowStaysOnTopHint 在 Tool 窗口上可能只更新内部 flag 而不映射到
+        # Windows WS_EX_TOPMOST，这里用 Win32 SetWindowPos 强制应用真实 Z 层级。
+        self._force_win32_topmost(int(self.winId()), self._on_top)
+        if getattr(self, "overlay", None) is not None and self.overlay.isVisible():
+            self._force_win32_topmost(int(self.overlay.winId()), self._on_top)
+        self.update()
+
+    @staticmethod
+    def _force_win32_topmost(hwnd: int, on_top: bool) -> int:
+        """用 SetWindowPos 强制置顶/取消置顶，返回 Win32 调用结果。"""
+        user32 = ctypes.windll.user32
+        if not user32.SetWindowPos.argtypes:
+            user32.SetWindowPos.argtypes = [
+                ctypes.wintypes.HWND, ctypes.wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.SetWindowPos.restype = ctypes.c_int
+        HWND_TOPMOST = ctypes.c_void_p(-1)
+        HWND_NOTOPMOST = ctypes.c_void_p(-2)
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOACTIVATE = 0x0010
+        target = HWND_TOPMOST if on_top else HWND_NOTOPMOST
+        return user32.SetWindowPos(
+            ctypes.wintypes.HWND(hwnd), target, 0, 0, 0, 0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+        )
 
     # ----- 绘制 -----
     def paintEvent(self, event):
@@ -644,9 +1438,23 @@ class PetWindow(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         if self._snapped:
             self._paint_bar(painter)
+            if self.style == "sprite":
+                self._paint_sprite(painter)
+        elif self.style == "sprite":
+            self._paint_sprite(painter)
         else:
             self._paint_orb(painter)
         self._paint_bubble(painter)
+
+    def _paint_sprite(self, painter: QPainter):
+        self.sprite.paint(
+            painter, self.width(), self.height(),
+            self.state, self._anim_t, self._snapped,
+        )
+        if os.environ.get("MARVIS_PET_DIAG"):
+            with open(f"pet_diag_{os.getpid()}.log", "a", encoding="utf-8") as _df:
+                _df.write(f"[diag] paint state={self.state} t={self._anim_t:.3f} snapped={self._snapped} "
+                          f"has_idle={self.sprite.has_image('idle')} size={self.width()}x{self.height()}\n")
 
     def _paint_bar(self, painter):
         """贴边收纳后的细扁条。"""
@@ -705,20 +1513,219 @@ class PetWindow(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(QPointF(cx, cy), r * 1.0 + off, r * 1.0 + off)
 
-    # ----- 鼠标拖拽 -----
+    # ----- 鼠标拖拽 + 甩抛物理 -----
+    # 甩抛初速估算：移植 dsh-pet src/shared/physics.ts 同款算法
+    # （轨迹窗口采样 → 端点均值+峰值加权 → 加速增益 → 软钳速 3600 封顶 → 死区 500）
+    _TRAIL_KEEP_MS = 200.0
+    _RELEASE_WINDOW_MS = 150.0
+    _RELEASE_STALE_MS = 150.0
+    _MIN_SPAN_MS = 20.0
+    _SEG_MIN_DT_MS = 8.0
+    _DEAD_ZONE_SPEED = 500.0
+    _MAX_THROW_SPEED = 3600.0
+    _PEAK_WEIGHT = 0.5
+    _ACCEL_REF = 8000.0
+    _ACCEL_GAIN_MAX = 0.6
+    # 拖拽弹簧（dsh-pet springStep 同款）：刚度 200、阻尼 30，过阻尼不 overshoot
+    _SPRING_K = 200.0
+    _SPRING_C = 30.0
+    # 落地停竖速度阈值（px/s）：|vy| 小于它直接停竖直，不再反弹
+    _REST_VY = 40.0
+    # 静止水平速度阈值（px/s）：贴地且 |vx| 小于它认为已静止
+    _REST_VX = 15.0
+
+    @staticmethod
+    def _soft_clamp_speed(speed: float) -> float:
+        if speed <= 0:
+            return 0.0
+        return PetWindow._MAX_THROW_SPEED * (1 - math.exp(-speed / PetWindow._MAX_THROW_SPEED))
+
+    @classmethod
+    def _estimate_release_velocity(cls, trail, now: float, power: float = 1.0):
+        """由拖拽轨迹估算松手初速 (vx, vy)，px/s；温柔放下返回 None。"""
+        if not trail:
+            return None
+        last = trail[-1]
+        if now - last[0] > cls._RELEASE_STALE_MS:
+            return None
+        win = [s for s in trail if now - s[0] <= cls._RELEASE_WINDOW_MS]
+        if len(win) < 2:
+            return None
+        t0, x0, y0 = win[0]
+        t1, x1, y1 = win[-1]
+        span_ms = t1 - t0
+        if span_ms < cls._MIN_SPAN_MS:
+            return None
+        base_vx = (x1 - x0) / span_ms * 1000.0
+        base_vy = (y1 - y0) / span_ms * 1000.0
+        base_speed = math.hypot(base_vx, base_vy)
+        if base_speed < 1e-6:
+            return None
+        # 分段速度（过密采样向前合并，dt 下限 SEG_MIN_DT_MS）
+        seg = []
+        px, py, pt = x0, y0, t0
+        for s in win[1:]:
+            dt = s[0] - pt
+            if dt >= cls._SEG_MIN_DT_MS:
+                seg.append(((math.hypot(s[1] - px, s[2] - py) / dt) * 1000.0, s[0]))
+                px, py, pt = s[1], s[2], s[0]
+        peak = max((v for v, _ in seg), default=base_speed)
+        # 末段加速度（仍在加速的甩动放大初速，最多 60%）
+        accel = 0.0
+        if len(seg) >= 2:
+            accel = (seg[-1][0] - seg[0][0]) / max((seg[-1][1] - seg[0][1]) / 1000.0, cls._MIN_SPAN_MS / 1000.0)
+        sp_before = ((1 - cls._PEAK_WEIGHT) * base_speed + cls._PEAK_WEIGHT * peak) * (
+            1 + min(max(accel, 0.0) / cls._ACCEL_REF, 1.0) * cls._ACCEL_GAIN_MAX)
+        speed = cls._soft_clamp_speed(sp_before) * power
+        if speed < cls._DEAD_ZONE_SPEED:
+            return None
+        return (base_vx / base_speed * speed, base_vy / base_speed * speed)
+
     def mousePressEvent(self, e):
+        self.mark_activity()  # 交互唤醒：重置空闲睡眠计时
         if e.button() == Qt.LeftButton:
+            self._stop_physics()
             self._dragging = True
             self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            # 轨迹时间戳统一用毫秒（与 dsh-pet 采样窗口常量同单位，避免秒/毫秒混用放大初速）
+            self._drag_last_ts = time.monotonic() * 1000.0
+            gp = e.globalPosition().toPoint()
+            self._drag_trail = [(self._drag_last_ts, gp.x(), gp.y())]
+            self._drag_last_global = e.globalPosition().toPoint()
+            # 拖拽弹簧初速（dsh-pet springStep）：按下时从 0 开始积累
+            self._spring_vx = 0.0
+            self._spring_vy = 0.0
 
     def mouseMoveEvent(self, e):
         if self._dragging:
-            self.move(e.globalPosition().toPoint() - self._drag_offset)
+            now = time.monotonic() * 1000.0
+            gp = e.globalPosition().toPoint()
+            # 追加轨迹采样点（保留最近 200ms，供甩抛初速估算；采样用鼠标绝对坐标，同 dsh-pet）
+            self._drag_trail.append((now, gp.x(), gp.y()))
+            cutoff = now - PetWindow._TRAIL_KEEP_MS
+            self._drag_trail = [s for s in self._drag_trail if s[0] >= cutoff]
+            # 弹簧跟手（dsh-pet springStep 同款）：宠物不直接贴鼠，过阻尼弹簧追目标
+            # v += ((target - x) * K - v * C) * power * dt;  x += v * dt
+            phys = self.cfg.get("physics", {})
+            power = float(phys.get("throwPower", 1.0))
+            dt = max(1e-4, (now - self._drag_last_ts) / 1000.0)
+            target = gp - self._drag_offset
+            pos = self.frameGeometry().topLeft()
+            self._spring_vx += ((target.x() - pos.x()) * PetWindow._SPRING_K
+                                - self._spring_vx * PetWindow._SPRING_C) * power * dt
+            self._spring_vy += ((target.y() - pos.y()) * PetWindow._SPRING_K
+                                - self._spring_vy * PetWindow._SPRING_C) * power * dt
+            nx = pos.x() + self._spring_vx * dt
+            ny = pos.y() + self._spring_vy * dt
+            self.move(int(nx), int(ny))
+            self._drag_last_ts = now
+            self._drag_last_global = gp
 
     def mouseReleaseEvent(self, e):
         if self._dragging:
             self._dragging = False
+            phys = self.cfg.get("physics", {})
+            power = float(phys.get("throwPower", 1.0))
+            # 初速估算用毫秒时间戳（与轨迹采样同单位）；物理循环仍用秒
+            now = time.monotonic() * 1000.0
+            v = PetWindow._estimate_release_velocity(self._drag_trail, now, power)
+            if v is not None:
+                # 达到甩抛阈值：抛掷（dsh-pet 同款初速估算 + 软钳速封顶）
+                self._phys_vx, self._phys_vy = v
+                # 物理循环时间戳用秒（与 _physics_tick 同单位，避免首帧 dt 异常）
+                self._phys_last_t = time.monotonic()
+                self._phys_active = True
+            else:
+                self._maybe_snap()
+
+    # ----- 甩抛物理循环（重力 / 碰壁反弹 / 落地摩擦）-----
+    def _physics_tick(self):
+        if not self._phys_active:
+            return
+        phys = self.cfg.get("physics", {})
+        g = float(phys.get("gravity", 1400))
+        rest = float(phys.get("restitution", 0.78))
+        friction = float(phys.get("groundFriction", 2.5))
+        ceiling = bool(phys.get("ceilingBounce", True))
+        now = time.monotonic()
+        dt = min(0.05, max(0.001, now - self._phys_last_t))
+        self._phys_last_t = now
+        self._phys_vy += g * dt
+        geom = self.frameGeometry()
+        nx = geom.x() + self._phys_vx * dt
+        ny = geom.y() + self._phys_vy * dt
+        screen = QApplication.primaryScreen().availableGeometry()
+        w, h = self.width(), self.height()
+        if nx <= screen.left():
+            nx = screen.left()
+            self._phys_vx = abs(self._phys_vx) * rest
+        elif nx + w >= screen.right():
+            nx = screen.right() - w
+            self._phys_vx = -abs(self._phys_vx) * rest
+        if ny <= screen.top():
+            ny = screen.top()
+            self._phys_vy = abs(self._phys_vy) * rest if ceiling else 0.0
+        elif ny + h >= screen.bottom():
+            ny = screen.bottom() - h
+            # dsh-pet 落地停竖：|vy| < REST_VY(40) 直接停竖直，否则弹性反弹
+            if abs(self._phys_vy) < PetWindow._REST_VY:
+                self._phys_vy = 0.0
+            else:
+                self._phys_vy = -abs(self._phys_vy) * rest
+            self._phys_vx *= max(0.0, 1.0 - friction * dt)
+        speed = (self._phys_vx ** 2 + self._phys_vy ** 2) ** 0.5
+        # dsh-pet 静止判定：贴地且 |vy|<1、|vx|<REST_VX(15)；或碰边后整体低速直接停
+        grounded = ny + h >= screen.bottom() - 1
+        if (grounded and abs(self._phys_vy) < 1.0 and abs(self._phys_vx) < PetWindow._REST_VX) or \
+           (speed < PetWindow._REST_VY and abs(self._phys_vy) < 1.0):
+            self._stop_physics()
             self._maybe_snap()
+            return
+        self.move(int(nx), int(ny))
+
+    def _stop_physics(self):
+        self._phys_active = False
+
+    # ----- 右键菜单（仿 dsh-pet：点播动作 / 工作状态 / 切换形象 / 置顶 / 退出）-----
+    def contextMenuEvent(self, e):
+        menu = QMenu(self)
+        anim_menu = menu.addMenu("点播动作")
+        anim_dir = os.path.join(assets_dir(), "anim")
+        anim_actions = []
+        if os.path.isdir(anim_dir):
+            anim_actions = sorted(d for d in os.listdir(anim_dir)
+                                  if os.path.isdir(os.path.join(anim_dir, d)))
+        for action in anim_actions:
+            anim_menu.addAction(action, lambda a=action: self._play_action(a))
+        ws_menu = menu.addMenu("工作状态")
+        for idx, lab in enumerate(("思考中", "工作中", "一步完成", "等你确认", "完成", "出错")):
+            ws_menu.addAction(lab, lambda i=idx: self._set_work_status(i))
+        menu.addSeparator()
+        char_menu = menu.addMenu("切换形象")
+        for key, name in CHARACTER_NAMES.items():
+            char_menu.addAction(name, lambda k=key: self.set_character(k))
+        menu.addAction("取消置顶" if self._on_top else "置顶显示",
+                       lambda: self.set_on_top(not self._on_top))
+        menu.addSeparator()
+        menu.addAction("退出", QApplication.instance().quit)
+        menu.exec(e.globalPos())
+
+    def _play_action(self, action: str):
+        """点播单动作：有逐帧素材播放一轮后回 idle；无素材仅回 idle。"""
+        if action in ANIM_ACTIONS.get("idle", []):
+            self.state = "idle"
+        self.sprite.play_once(action, self._anim_t)
+        self.update()
+
+    def _set_work_status(self, idx: int):
+        """工作状态六档气泡（仿 dsh-pet workStatusTexts），并切对应 4 态贴图。"""
+        texts = self.cfg.get("work_status_texts", [])
+        pool = texts[idx] if 0 <= idx < len(texts) else []
+        state_map = {0: "thinking", 1: "thinking", 2: "replying", 3: "idle", 4: "idle", 5: "error"}
+        self.state = state_map.get(idx, "idle")
+        if pool:
+            self.add_bubble(random.choice(pool))
+        self.update()
 
     def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -743,6 +1750,8 @@ class PetWindow(QWidget):
         self._restore_rect = geom
         bar_w = max(6, min(10, self.width() // 8))
         screen = QApplication.primaryScreen().availableGeometry()
+        # setFixedSize 会阻止 setGeometry 改变尺寸，压扁前必须先解除固定尺寸
+        self.setFixedSize(bar_w, geom.height())
         if side == "left":
             self.setGeometry(QRect(screen.left(), geom.top(), bar_w, geom.height()))
         else:
@@ -753,6 +1762,8 @@ class PetWindow(QWidget):
         if self._snapped:
             self._snapped = False
             if not self._restore_rect.isNull():
+                self.setFixedSize(getattr(self, "_pet_w", self._pet_size),
+                                  getattr(self, "_pet_h", self._pet_size))
                 self.setGeometry(self._restore_rect)
             self.update()
 
@@ -989,9 +2000,35 @@ class ChatPanel(QWidget):
     def _update_usage(self, usage: dict):
         p = int(usage.get("prompt_eval_count") or 0)
         e = int(usage.get("eval_count") or 0)
+        before = self._session_usage["prompt"]
         self._session_usage["prompt"] += p
         self._session_usage["eval"] += e
         self._update_token_label(p, e)
+        self._check_balance_tier(before, self._session_usage["prompt"])
+
+    def _check_balance_tier(self, before: int, after: int):
+        """累计 prompt token 跨过余额分档阈值 → 点播对应钱袋动作一轮（仿 dsh-pet）。"""
+        pet = getattr(self, "pet", None)
+        if pet is None:
+            return
+
+        def tier_of(v: int) -> int:
+            t = len(BALANCE_TIERS)
+            for i, (th, _a) in enumerate(BALANCE_TIERS):
+                if v < th:
+                    return i
+            return t
+
+        b0, b1 = tier_of(before), tier_of(after)
+        if b1 == b0:
+            return
+        if b1 >= len(BALANCE_TIERS):
+            action = "余额-分文不剩"
+        else:
+            action = BALANCE_TIERS[b1][1]
+        pet.mark_activity()
+        pet.sprite.play_once(action, pet._anim_t)
+        pet.update()
 
     def _update_token_label(self, p: int, e: int):
         sp = self._session_usage["prompt"]
@@ -1057,6 +2094,56 @@ class TrayManager(QObject):
 
         menu.addSeparator()
 
+        # 形象切换（真实形象 / 大肥鱼 / 小马），即时生效并写回 config.json
+        char_menu = QMenu("形象切换", menu)
+        char_group = QActionGroup(char_menu)
+        char_group.setExclusive(True)
+        for key in CHARACTER_NAMES:
+            act = QAction(CHARACTER_NAMES[key], char_menu)
+            act.setCheckable(True)
+            act.setChecked(self.pet.character == key)
+            act.triggered.connect(lambda checked, k=key: self._set_character(k))
+            char_group.addAction(act)
+            char_menu.addAction(act)
+        menu.addMenu(char_menu)
+
+        # 大肥鱼版本切换（成年 / 幼年，仅 fish 形象生效），即时生效并写回 config.json
+        fish_version_menu = QMenu("大肥鱼版本", menu)
+        fv_group = QActionGroup(fish_version_menu)
+        fv_group.setExclusive(True)
+        for key in ("adult", "baby"):
+            act = QAction(FISH_VERSION_NAMES[key], fish_version_menu)
+            act.setCheckable(True)
+            act.setChecked(self.pet.fish_version == key)
+            act.triggered.connect(lambda checked, k=key: self._set_fish_version(k))
+            fv_group.addAction(act)
+            fish_version_menu.addAction(act)
+        menu.addMenu(fish_version_menu)
+
+        # 渲染风格切换（图片形象 / 粒子光球），即时生效并写回 config.json
+        style_menu = QMenu("渲染风格", menu)
+        style_group = QActionGroup(style_menu)
+        style_group.setExclusive(True)
+        for key, label in (("sprite", "图片形象"), ("orb", "粒子光球")):
+            act = QAction(label, style_menu)
+            act.setCheckable(True)
+            act.setChecked(self.pet.style == key)
+            act.triggered.connect(lambda checked, k=key: self._set_style(k))
+            style_group.addAction(act)
+            style_menu.addAction(act)
+        menu.addMenu(style_menu)
+
+        menu.addSeparator()
+
+        # 位置策略：默认桌面层（不遮挡工作窗口），可切换置顶悬浮，即时生效并写回 config.json
+        act_ontop = QAction("置顶显示（默认桌面层不遮挡）", menu)
+        act_ontop.setCheckable(True)
+        act_ontop.setChecked(bool(self.pet.cfg.get("pet_on_top", False)))
+        act_ontop.toggled.connect(self._set_on_top)
+        menu.addAction(act_ontop)
+
+        menu.addSeparator()
+
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self._quit)
         menu.addAction(act_quit)
@@ -1065,6 +2152,34 @@ class TrayManager(QObject):
         self.tray.activated.connect(self._on_activated)
         self.tray.show()
         return True
+
+    def _set_character(self, key: str):
+        self.pet.set_character(key)
+        cfg = dict(self.pet.cfg)
+        cfg["pet_character"] = key
+        self.pet.cfg = cfg
+        save_config(cfg)
+
+    def _set_fish_version(self, key: str):
+        self.pet.set_fish_version(key)
+        cfg = dict(self.pet.cfg)
+        cfg["fish_version"] = key
+        self.pet.cfg = cfg
+        save_config(cfg)
+
+    def _set_style(self, key: str):
+        self.pet.set_style(key)
+        cfg = dict(self.pet.cfg)
+        cfg["pet_style"] = key
+        self.pet.cfg = cfg
+        save_config(cfg)
+
+    def _set_on_top(self, checked: bool):
+        self.pet.set_on_top(bool(checked))
+        cfg = dict(self.pet.cfg)
+        cfg["pet_on_top"] = bool(checked)
+        self.pet.cfg = cfg
+        save_config(cfg)
 
     def _toggle_pet(self):
         self.pet.setVisible(not self.pet.isVisible())
@@ -1106,6 +2221,7 @@ def main():
         lambda: pet.chat_panel.toggle_visible(pet.frameGeometry())
     )
     ok = hotkey.start(str(cfg.get("hotkey", "ctrl+alt+j")))
+    _hook_diag("main: hotkey.start ret=%s" % ok)
 
     if cfg.get("auto_start", False) and not is_autostart():
         set_autostart(True)

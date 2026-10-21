@@ -1,3 +1,16 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: d9895d0aa1b93a25de031252b375f54d_b27bb68bcb9011f18533525400638852
+    ReservedCode1: LQoa1wOghaKa/ty7hOJQBOsHGkQ7T81dp8qnLrs4YULgfev5vliGq2mKShEWnB/ZnJ1npVfHEm2Utq/r62bJ8k9qMPBbcAaOEZe3cd8V4CwNuDbtO5nJBCKdqJtWtsM3SDiC6rvi4/tyNP/YPnuXhpsKjzRjbZFBOz2xEqDGUaLe5eAr+3WB/RiJsEY=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: d9895d0aa1b93a25de031252b375f54d_b27bb68bcb9011f18533525400638852
+    ReservedCode2: LQoa1wOghaKa/ty7hOJQBOsHGkQ7T81dp8qnLrs4YULgfev5vliGq2mKShEWnB/ZnJ1npVfHEm2Utq/r62bJ8k9qMPBbcAaOEZe3cd8V4CwNuDbtO5nJBCKdqJtWtsM3SDiC6rvi4/tyNP/YPnuXhpsKjzRjbZFBOz2xEqDGUaLe5eAr+3WB/RiJsEY=
+---
+
+
+
 # Marvis Pet 冒烟测试报告
 
 - 测试日期：2026-10-19
@@ -13,7 +26,7 @@
 | keyboard | 0.13.5 | ✅ 成功 |
 | pyinstaller | 6.22.3 | ✅ 成功 |
 
-- 虚拟环境：`<项目所在目录>\marvis-pet\.venv`
+- 虚拟环境：`C:\Users\makexuan\Desktop\Marvis产出\marvis-pet\.venv`
 - 镜像：`https://mirrors.aliyun.com/pypi/simple`（首次全量安装 PySide6 曾超时，拆包续装后成功）
 
 ## Ollama 状态
@@ -103,3 +116,37 @@
 1. TaskCardItem 初始化顺序：`_expire` 定时器创建前调用 `set_state` 会触发 AttributeError，已调整创建顺序。
 2. 冒烟脚本 Win32 枚举：Python 3.12 下 `EnumWindows` 回调需通过 `ctypes.WINFUNCTYPE` 声明类型，否则 `ArgumentError`。
 3. 热键回归测试需等待进程启动后热键监听注册完成再注入按键（窗口出现 ≈2.5s 后注入稳定通过）。
+
+---
+
+# 真实形象重制冒烟实测（2026-10-20）
+
+- 测试内容：以老板 9 张原图为唯一依据的真实逐帧形象（real）接入验证（对应 93 号会话迁移待办 #1/#2/#3）
+- 测试环境：Windows 11 (Build 26300)，Python 3.12.10（项目独立 .venv），源码模式
+- 测试方式：素材单测 + 帧轮播单测 + 离屏渲染单测 + 进程级冒烟（diag 日志）+ 代码级真实 paintEvent（win.grab()）
+
+| 用例 | 结果 | 说明 |
+|---|---|---|
+| R1 real 四态单贴图素材就位 | ✅ | assets/real_idle/thinking/replying/error.png 全部就位，均 ≥1024 |
+| R2 real 逐帧素材就位 | ✅ | assets/anim/real_<state>/frame_*.png 共 9 帧（idle 2 / thinking 3 / replying 2 / error 2），对应 9 张原图 |
+| R3 帧分辨率 ≥1024 | ✅ | 所有帧 1024x1024，满足红线 |
+| R4 帧轮播切换 | ✅ | _pick_frame 按帧序列逐帧轮播，非静态贴图 |
+| R5 四态切换（离屏/snapped） | ✅ | idle/thinking/replying/error 状态切换渲染无异常 |
+| R6 PetWindow 集成 | ✅ | 窗口加载 real 形象渲染正常 |
+| R7 进程级启动 | ✅ | 源码模式启动，窗口出现；diag 显示 real 四态 QPixmap null=False，paint 持续触发（374 次） |
+| R8 热键唤出面板 | ✅ | Ctrl+Alt+J 唤出对话面板回归通过 |
+| R9 代码级四态真实渲染 | ✅ | win.grab() 真实 paintEvent 四态渲染 OK，逐帧序列均 ≥2 帧，ALL_OK |
+
+### 结论
+
+- real 形象已替换粒子光球成为默认形象（config.json pet_character=real；main.py DEFAULT_CONFIG 同步，CHARACTER_STATES/CHARACTER_NAMES 增 real 四态）。
+- 四态逐帧动效正常，素材全部来自 9 张原图抠像/裁切（≥1024），无程序自绘替代，符合红线（以 9 图为准 / 高清 ≥1024 / 真实逐帧）。
+- 旧 fish_*/pony_*.png 保留未删，可通过托盘菜单 CHARACTER_NAMES 切换回旧形象。
+
+### 本轮修复记录
+
+1. 环境变量诊断日志（MARVIS_PET_DIAG=1 → pet_diag.log）用于验证透明窗口加载绘制链，避免透明 Qt 窗口截图误判。
+2. 透明 Qt 窗口验证不依赖 PrintWindow（只能截到透明内容），以全屏截图 + 视觉定位 / 离屏 grab 为准。
+
+*（内容由AI生成，仅供参考）*
+*（内容由AI生成，仅供参考）*

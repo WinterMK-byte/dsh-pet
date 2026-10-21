@@ -54,6 +54,8 @@ const fsPromises = require('node:fs/promises');
 const { decideWindowIgnore, pointerZone } = require('./pointer-target.js');
 // 置顶看门狗：WS_EX_TOPMOST 只是样式位，不等于窗口真的在置顶带（见 topmost-watchdog.js 头部）
 const { TOPMOST_WATCHDOG_TICK_MS, shouldReassertTopmost } = require('./topmost-watchdog.js');
+// 前台独占遮挡看门狗：全屏游戏/全屏视频时桌宠不许挡前台资源（判定见 foreground-watchdog.js 头部）
+const { FOREGROUND_WATCHDOG_TICK_MS, shouldHideForForeground } = require('./foreground-watchdog.js');
 // 宿主存活判定（issue #56：宿主退出 → 管道断开 → 自己退，绝不弹框、绝不留僵尸）
 const { HOST_POLL_MS, hostIsGone, isBrokenPipeError, parseHostPid } = require('./host-liveness.js');
 // 全局 DPI 线性化的纯判定与换算（含平台例外：macOS 的 DIP 已是「点」，无需补偿；见该文件头）
@@ -70,10 +72,62 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 // 我们的 DPI 缓存与 Chromium profile 都会和别人混在一起。必须赶在任何 getPath('userData') 之前设。
 app.setName('dsh-pet-electron-helper');
 
+// 单实例锁：standalone 宿主与 DeepSeek Harness 可能同时拉起本进程（二者共用同一 userData，
+// Chromium profile 互斥会让后启动实例的 renderer 起不来、窗口卡隐藏且永不退出）。锁保证
+// 同一时刻只保留一个 helper 实例；后启动者直接退出，先启动者接管全部桌面宠物窗口。
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+}
+
 /** DPI 探测子进程模式：不建窗口，只把主屏 scaleFactor 打到 stdout 就退出（见 probePrimaryScale） */
 const DPI_PROBE = process.env.DSH_PET_DPI_PROBE === '1';
 /** 探测进程的输出标记（父进程按它抓值） */
 const DPI_MARK = 'dsh-pet-primary-scale:';
+
+// ---------- 前台独占探测（全屏游戏/全屏视频遮挡治理，仅 Windows） ----------
+// 常驻 PowerShell 探测进程（foreground-probe.ps1）持续输出「前台窗口是否全屏独占」的 1/0 行，
+// 主进程按行解析维护 fgExclusiveNow；探测不可用（非 Windows / PowerShell 缺失 / 进程退出）
+// 置 fgProbeAvailable=false，每窗看门狗直接不动作——宁可不治理也不误藏（见 foreground-watchdog.js）。
+let fgProbeAvailable = false;
+let fgExclusiveNow = false;
+let fgProbeChild = null;
+
+function startForegroundProbe() {
+  if (process.platform !== 'win32') return; // 仅 Windows 需要探测（macOS 桌面宠物不抢占全屏）
+  if (fgProbeChild || !app.whenReady) return;
+  const probeScript = path.join(__dirname, 'foreground-probe.ps1');
+  try {
+    fgProbeChild = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', probeScript], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    fgProbeChild.stdout.setEncoding('utf8');
+    fgProbeChild.stdout.on('data', (chunk) => {
+      for (const line of String(chunk).split(/\r?\n/)) {
+        const v = line.trim();
+        if (v === '1' || v === '0') fgExclusiveNow = v === '1';
+      }
+    });
+    fgProbeChild.on('error', () => {
+      fgProbeAvailable = false;
+      fgExclusiveNow = false; // 探测不可用后立即视为非独占：看门狗只负责"独占时隐藏"，不负责在失去探测时继续藏窗口
+      fgProbeChild = null;
+    });
+    fgProbeChild.on('exit', () => {
+      fgProbeAvailable = false;
+      fgExclusiveNow = false;
+      fgProbeChild = null;
+    });
+    fgProbeAvailable = true;
+  } catch (error) {
+    fgProbeAvailable = false;
+    fgProbeChild = null;
+    console.error(
+      '[dsh-pet-desktop-helper] foreground probe start failed:',
+      String(error && error.message ? error.message : error),
+    );
+  }
+}
 
 // ---------- 宿主存活（issue #56）：管道断开 / 父进程消失 → 自己退出 ----------
 //
@@ -535,9 +589,37 @@ function createPetWindows() {
       lastTopmostAssertMs = nowMs;
       win.setAlwaysOnTop(true, 'screen-saver');
     }, TOPMOST_WATCHDOG_TICK_MS);
+    // [前台独占遮挡治理] 全屏游戏/全屏视频（前台窗口完整覆盖所在显示器）时桌宠不许挡前台资源：
+    // 探测子进程持续上报「前台是否全屏独占」，这里跑防抖状态机——连续独占达到
+    // FOREGROUND_HIDE_DELAY_MS 就隐藏窗口，回到普通前台（桌面 / 窗口应用）立即恢复显示。
+    // 探测不可用（非 Windows / PowerShell 缺失 / 探测进程挂了）时不隐藏，宁可不治理也不误藏
+    // （判定的纯逻辑与全部依据见 foreground-watchdog.js）。
+    let fgExclusiveSinceMs = null;
+    const fgTimer = setInterval(() => {
+      if (win.isDestroyed()) return;
+      const nowMs = Date.now();
+      // 只有这一拍探测到独占才续算连续时长；任何一拍非独占立刻清零（探测漏拍不会累加）
+      fgExclusiveSinceMs = fgExclusiveNow ? (fgExclusiveSinceMs ?? nowMs) : null;
+      const hide = shouldHideForForeground({
+        nowMs,
+        exclusiveSinceMs: fgExclusiveSinceMs,
+        exclusive: fgExclusiveNow,
+        destroyed: false,
+      });
+      if (hide) {
+        if (win.isVisible()) win.hide();
+      } else if (!win.isVisible()) {
+        // 恢复显示不抢焦点（showInactive）；隐藏期间置顶看门狗不重钉，恢复后自然回置顶带。
+        // 注意：这里不依赖 fgProbeAvailable——探测不可用时 fgExclusiveNow 已被置 false，
+        // 不会触发 hide，但窗口若处于隐藏态（如探测进程曾短暂误报后又退出）必须能恢复，
+        // 否则桌宠会卡在"看不见"的坏状态（治理是体验优化，恢复显示是无损安全操作）。
+        win.showInactive();
+      }
+    }, FOREGROUND_WATCHDOG_TICK_MS);
     win.on('closed', () => {
       clearInterval(pointerTimer);
       clearInterval(topmostTimer);
+      clearInterval(fgTimer);
       windows.delete(pet.id);
       lastRequestedBounds.delete(win.id);
       winMargins.delete(win.id);
@@ -811,6 +893,10 @@ app.whenReady().then(() => {
 
   // 托盘：不 await（建窗与建托盘互不依赖），内部自己等 bridge 回调服务就绪
   void startTray();
+
+  // 前台独占探测：在桌宠建窗显示前先把探测进程拉起来（探测就绪前 fgProbeAvailable=false，
+  // 看门狗不动作；探测就绪后开始生效）
+  startForegroundProbe();
 
   createPetWindows();
 

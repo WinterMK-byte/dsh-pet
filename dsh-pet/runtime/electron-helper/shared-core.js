@@ -398,10 +398,10 @@ function balanceBubbleView(state) {
 			};
 			return [{
 				role: "label",
-				text: "今日已用 " + fmt(state?.data?.rolling) + " tokens"
+				text: "今日已用 " + fmt(state?.rolling) + " tokens"
 			}, {
 				role: "sub",
-				text: "本月已用 " + fmt(state?.data?.monthly) + " tokens"
+				text: "本月已用 " + fmt(state?.monthly) + " tokens"
 			}];
 		}
 		if (state.shape !== "money") {
